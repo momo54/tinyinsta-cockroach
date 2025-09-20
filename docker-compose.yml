@@ -1,0 +1,75 @@
+# Docker Compose file to run a CockroachDB cluster with 5 nodes (shards) in Codespaces
+version: '3.8'
+
+services:
+  cockroach1:
+    image: cockroachdb/cockroach:v23.1.11
+    command: start --insecure --join=cockroach1,cockroach2,cockroach3,cockroach4,cockroach5
+    hostname: cockroach1
+    ports:
+      - "8080:8080"
+      - "26257:26257"
+    volumes:
+      - cockroach1-data:/cockroach/cockroach-data
+      - ./init.sql:/init.sql
+
+  cockroach2:
+    image: cockroachdb/cockroach:v23.1.11
+    command: start --insecure --join=cockroach1,cockroach2,cockroach3,cockroach4,cockroach5
+    hostname: cockroach2
+    ports:
+      - "8081:8080"
+      - "26258:26257"
+    volumes:
+      - cockroach2-data:/cockroach/cockroach-data
+
+  cockroach3:
+    image: cockroachdb/cockroach:v23.1.11
+    command: start --insecure --join=cockroach1,cockroach2,cockroach3,cockroach4,cockroach5
+    hostname: cockroach3
+    ports:
+      - "8082:8080"
+      - "26259:26257"
+    volumes:
+      - cockroach3-data:/cockroach/cockroach-data
+
+  cockroach4:
+    image: cockroachdb/cockroach:v23.1.11
+    command: start --insecure --join=cockroach1,cockroach2,cockroach3,cockroach4,cockroach5
+    hostname: cockroach4
+    ports:
+      - "8083:8080"
+      - "26260:26257"
+    volumes:
+      - cockroach4-data:/cockroach/cockroach-data
+
+  cockroach5:
+    image: cockroachdb/cockroach:v23.1.11
+    command: start --insecure --join=cockroach1,cockroach2,cockroach3,cockroach4,cockroach5
+    hostname: cockroach5
+    ports:
+      - "8084:8080"
+      - "26261:26257"
+    volumes:
+      - cockroach5-data:/cockroach/cockroach-data
+
+  init-cluster:
+    image: cockroachdb/cockroach:v23.1.11
+    depends_on:
+      - cockroach1
+    entrypoint: ["/bin/bash", "-c", "sleep 10 && cockroach init --insecure --host=cockroach1"]
+
+  init-cockroach:
+    image: cockroachdb/cockroach:v23.1.11
+    depends_on:
+      - init-cluster
+    volumes:
+      - ./init.sql:/init.sql
+    entrypoint: ["/bin/bash", "-c", "sleep 10 && cockroach sql --insecure --host=cockroach1 -f /init.sql"]
+
+volumes:
+  cockroach1-data:
+  cockroach2-data:
+  cockroach3-data:
+  cockroach4-data:
+  cockroach5-data:
