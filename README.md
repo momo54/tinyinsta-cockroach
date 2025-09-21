@@ -153,7 +153,12 @@ If you prefer a social-graph use case, use `init_instagram.sql` to create a tiny
 ### Load the dataset
 
 ```bash
-docker exec -it cockroach-cockroach1-1 ./cockroach sql --insecure --host=cockroach1 -f /init_instagram.sql
+# Option 1 (recommended): stream the SQL into the container via stdin
+docker exec -i cockroach-cockroach1-1 ./cockroach sql --insecure --host=cockroach1 < init_instagram.sql
+
+# Option 2: if the file is mounted at /init_instagram.sql inside the container
+# (e.g., add a volume mapping in docker-compose), then:
+# docker exec -it cockroach-cockroach1-1 ./cockroach sql --insecure --host=cockroach1 -f /init_instagram.sql
 ```
 
 ### Try some queries
@@ -175,3 +180,139 @@ JOIN insta.posts p ON p.id = pl.post_id
 ORDER BY pl.likes DESC
 LIMIT 10;
 ```
+
+### Explain plans to study distribution
+
+```sql
+-- 1) Lookup a single post by PK (span pruning to one key)
+EXPLAIN SELECT * FROM insta.posts WHERE id = 2100;
+
+-- 2) Feed for user 1 (posts by people they follow)
+EXPLAIN SELECT p.id, p.author_id, p.caption
+FROM insta.posts p
+JOIN insta.follows f ON f.followee_id = p.author_id
+WHERE f.follower_id = 1
+ORDER BY p.created_at DESC
+LIMIT 20;
+
+-- 3) Count likes for a post (uses likes_by_post_idx)
+EXPLAIN SELECT COUNT(*) FROM insta.likes WHERE post_id = 2100;
+
+-- 4) Which range holds post 2100?
+SHOW RANGE FROM TABLE insta.posts FOR ROW (2100);
+
+-- 5) Make key bounds human-readable for posts
+SELECT range_id,
+  start_key AS start_span,
+  end_key   AS end_span,
+  lease_holder, voting_replicas
+FROM [SHOW RANGES FROM INDEX insta.posts@primary];
+```
+
+Reading tips:
+- spans: [/2100 - /2100] indicates exact PK lookup (no full scan).
+- lookup join: for each left row, an index lookup on the right table—optimal when join keys are indexed.
+- distribution: local vs full—full means operators run on multiple nodes.
+
+### Expected observations
+
+- PK lookup on `insta.posts` with `WHERE id = 2100`:
+  - `table: insta.posts@primary`, `spans: [/2100 - /2100]` (span pruning to a single key)
+  - `distribution: local` is common for single-key lookups
+
+- Feed for user 1 (join posts × follows):
+  - Plan includes a `lookup join` using `follows(follower_id)` and `posts(author_id, created_at)` index
+  - Limited scan on `follows` for `follower_id = 1`, then lookups on `posts`
+  - With LIMIT + ORDER BY, expect a `limit` and ordered scan on `posts_author_created_idx`
+
+- Likes count for a given post:
+  - Uses `likes_by_post_idx`; spans limited to the given `post_id`
+  - For `EXPLAIN ANALYZE`, check `rows read from KV` stays proportional to the number of likes on that post
+
+- Sharding view:
+  - `SHOW RANGES FROM TABLE insta.posts` should reflect manual splits at 2000/3000/4000/5000
+  - `SHOW RANGE FROM TABLE insta.posts FOR ROW (2100)` should map to the [2000,3000) range
+
+  ## 🛠 Makefile shortcuts (optional)
+
+  You can use the provided Makefile to speed up common tasks:
+
+  ```bash
+  make up            # Start the cluster
+  make init          # Initialize the cluster (once)
+  make sql           # Open interactive SQL shell
+  make load-petitions
+  make load-insta
+  make ranges-posts  # SHOW RANGES FROM TABLE insta.posts
+  make range-post ID=2100  # SHOW RANGE FOR ROW
+  make rowcounts     # Quick counts for insta tables
+  ```
+
+## 🔄 Démonstration: failover et déplacement de leases
+
+Montrez le comportement du cluster quand un nœud s'arrête puis redémarre: les leases (droit de lecture/écriture pour un range) basculent automatiquement et, si un nœud reste indisponible suffisamment longtemps, les réplicas sont re-répliqués ailleurs.
+
+Pré-requis: chargez le dataset Instagram pour visualiser des ranges sur `insta.posts`.
+
+### 1) Avant l'arrêt — observez l'état
+
+```bash
+make show-nodes
+make ranges-posts-pretty
+make lease-post ID=2100   # Voir le lease holder pour la clé 2100
+```
+
+Astuce: lancez en continu pour observer les changements en direct:
+
+```bash
+make watch-lease-post ID=2100
+# ou
+make watch-ranges-posts
+```
+
+### 2) Arrêtez un nœud et observez la bascule
+
+Dans un autre terminal:
+
+```bash
+make stop-node N=3   # arrête le conteneur cockroach3
+```
+
+Retournez sur le watcher: au bout de quelques secondes, le `lease_holder` de la range ciblée doit changer (vers un autre nœud présent dans `voting_replicas`).
+
+Vous pouvez aussi revérifier ponctuellement:
+
+```bash
+make show-nodes
+make lease-post ID=2100
+make ranges-posts-pretty
+```
+
+### 3) Accélérer la détection de nœud mort (optionnel)
+
+Par défaut, CockroachDB attend plusieurs minutes avant de considérer un store « dead » et de lancer une re-rélication. Pour la démo, vous pouvez réduire ce délai:
+
+```bash
+make fast-failover
+make show-failover
+```
+
+Laissez le nœud arrêté > 30s, puis observez si `voting_replicas` change (un nouveau réplica peut apparaître). Note: le recluster/SCATTER n'est pas instantané et peut continuer en arrière-plan.
+
+### 4) Redémarrez le nœud
+
+```bash
+make start-node N=3
+```
+
+Ensuite, vous pouvez re-scatter les ranges pour rééquilibrer:
+
+```bash
+make scatter-posts
+make ranges-posts-pretty
+```
+
+Notes utiles:
+- `lease_holder` peut migrer dynamiquement selon la charge et la latence, même sans panne.
+- Les `voting_replicas` représentent l'ensemble des réplicas votants pour un range. Ils ne changent qu'en cas de reconfiguration (ajout/retrait de réplicas), ce qui prend plus de temps que le simple transfert de lease.
+- Pour cartographier les IDs de nœud avec les conteneurs/adresses, utilisez `SHOW NODES;`.

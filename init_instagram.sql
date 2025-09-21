@@ -65,7 +65,9 @@ ON CONFLICT (id) DO NOTHING;
 
 -- Each user posts 10 posts to create enough rows for splitting
 INSERT INTO posts (id, author_id, caption, created_at)
-SELECT p_id, author, CONCAT('Post #', p_id, ' by user ', author), now() - (p_id % 50) * INTERVAL '1 minute'
+SELECT p_id, author,
+       'Post #' || p_id::STRING || ' by user ' || author::STRING AS caption,
+       now() - (p_id % 50) * INTERVAL '1 minute'
 FROM (
   SELECT author, generate_series(1,10) AS seq FROM (VALUES (1),(2),(3),(4),(5)) AS u(author)
 ) AS g
